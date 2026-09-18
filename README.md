@@ -1,155 +1,210 @@
 # opencombine
 
-A self-hosted OpenAI-compatible gateway that combines **New API**, **Resin**, and **OpenCode Zen**.
+一个将 **New API**、**Resin** 和 **OpenCode Zen** 组合起来的自托管 OpenAI 兼容网关方案。
 
-This repository documents a working deployment pattern, the request-format changes required after OpenCode Zen tightened free-tier client validation in September 2026, and the troubleshooting process used to distinguish gateway, proxy, streaming, authentication, and upstream-model failures.
+这个仓库记录了一套已经实际跑通的部署方式，以及在 2026 年 9 月 OpenCode Zen 加强免费层客户端校验后，如何定位并解决 403、流式响应解析、渠道路由、模型鉴权等问题。
 
-> This repository intentionally contains **no real API keys, session IDs, proxy subscriptions, server IPs, domains, access tokens, or other private credentials**. Replace every placeholder with your own value and keep secrets out of Git.
+> 本仓库**不会包含任何真实 API Key、Session、代理订阅、服务器 IP、域名、访问令牌或其他敏感信息**。所有示例均使用占位符，请自行替换，并且不要把真实密钥提交到 Git。
 
-## Architecture
+## 整体架构
 
 ```text
-Client
+客户端
   |
-  | OpenAI-compatible request
+  | OpenAI 兼容请求
   v
 New API
   |
-  | channel routing / request override
+  | 渠道路由 / 请求头与参数覆盖
   v
 Resin
   |
-  | optional proxy-pool egress
+  | 可选代理出口 / 多节点
   v
 OpenCode Zen
   |
   v
-Upstream model
+上游模型
 ```
 
-Typical public deployment:
+典型公网部署链路：
 
 ```text
-Client
-  -> HTTPS reverse proxy
+客户端
+  -> HTTPS 反向代理
   -> New API :3000
   -> Resin :2260
   -> https://opencode.ai/zen
 ```
 
-## What changed
+## 问题背景
 
-A configuration that previously worked with ordinary OpenAI-compatible requests began returning:
+原本可以正常工作的 OpenAI 兼容请求，后来开始返回：
 
 ```text
 403 FreeTierError
 OpenCode's free tier can only be used from within OpenCode
 ```
 
-The infrastructure itself was healthy:
+排查后确认基础设施本身都正常：
 
-- New API was running.
-- Resin was reachable from the New API container.
-- Proxy egress was working.
-- The OpenCode Zen endpoint was reachable.
-- The same model could still work from the official OpenCode client.
+- New API 正常运行
+- New API 容器可以访问 Resin
+- Resin 代理出口正常
+- OpenCode Zen 可访问
+- 同一个模型在 OpenCode 客户端里仍然可用
 
-The issue was request validation at the upstream layer.
+最终问题出在上游对请求来源和请求结构的校验。
 
-## Verified request requirements
+## 已验证的关键请求条件
 
-Testing isolated the request fields one by one.
+通过逐项删减和对比请求，确认了以下条件。
 
-For the tested free chat-completions models, the successful request shape required all of the following:
+对于测试过的免费 `chat/completions` 模型，成功请求至少需要：
 
-1. An OpenCode-style `User-Agent`, for example:
+### 1. OpenCode 风格 User-Agent
+
+例如：
 
 ```http
 User-Agent: opencode/1.18.31
 ```
 
-2. A **valid session value from your own OpenCode client**:
+完整的：
+
+```text
+opencode/1.18.31 ai-sdk/provider-utils/4.0.46 runtime/bun/1.3.14
+```
+
+也可以。
+
+测试中已经确认，后面的 `ai-sdk/provider-utils` 和 `runtime/bun` 并不是必要条件。
+
+### 2. 有效的 x-opencode-session
+
+例如：
 
 ```http
 x-opencode-session: <YOUR_VALID_OPENCODE_SESSION>
 ```
 
-A random value with the same `ses_...` shape was rejected.
+这里必须是你自己的 OpenCode 客户端产生的有效 Session。
 
-3. Streaming enabled by the client:
+测试结果：
+
+```text
+真实有效 session -> 成功
+随机伪造 ses_xxx -> 403 FreeTierError
+```
+
+所以仅仅伪造一个看起来像 `ses_...` 的值是不够的。
+
+### 3. 客户端必须使用流式请求
+
+请求体中必须有：
 
 ```json
 "stream": true
 ```
 
-4. A `tools` array containing both function names:
+### 4. tools 中同时存在 bash 和 read
+
+请求体中需要同时包含：
 
 ```text
 bash
 read
 ```
 
-The tool descriptions were not important in testing.
+两个 function tool。
 
-The following were tested and were **not required** for the successful request:
+测试结果：
+
+```text
+只有 bash          -> 失败
+只有 read          -> 失败
+bash + dummy       -> 失败
+dummy + read       -> 失败
+bash + read        -> 成功
+```
+
+工具的 `description` 文本不重要，改成简单的 `"x"` 也可以正常使用。
+
+## 已确认不是必要条件的字段
+
+以下字段经过单独测试，确认不是成功请求的必要条件：
 
 - `x-opencode-request`
 - `x-opencode-client`
 - `x-opencode-project`
-- the longer `ai-sdk/provider-utils ... runtime/bun ...` part of the User-Agent
+- User-Agent 后面的 `ai-sdk/provider-utils ... runtime/bun ...`
 - `tool_choice: "auto"`
 - `stream_options.include_usage`
-- specific tool descriptions
+- tools 的具体 description 内容
 
-## Minimal direct upstream test
+因此当前最核心的组合可以概括为：
 
-Use only credentials/session data belonging to you. Never commit the real session value.
+```text
+OpenCode 风格 User-Agent
++
+有效 x-opencode-session
++
+stream: true
++
+tools 中同时存在 bash 和 read
+```
 
-Create a request body:
+## 直接测试 OpenCode Zen
+
+只使用你自己的合法 Session，不要把真实 Session 提交到仓库。
+
+先创建请求体：
 
 ```bash
 cat > /tmp/opencode-test.json <<'EOF'
-{"model":"mimo-v2.5-free","stream":true,"messages":[{"role":"user","content":"Reply with OK only"}],"tools":[{"type":"function","function":{"name":"bash","description":"x","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"read","description":"x","parameters":{"type":"object","properties":{}}}}]}
+{"model":"mimo-v2.5-free","stream":true,"messages":[{"role":"user","content":"只回复OK"}],"tools":[{"type":"function","function":{"name":"bash","description":"x","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"read","description":"x","parameters":{"type":"object","properties":{}}}}]}
 EOF
 ```
 
-Then test the upstream directly:
+然后直接请求 OpenCode Zen：
 
 ```bash
 curl -N -s https://opencode.ai/zen/v1/chat/completions -H "Content-Type: application/json" -H "User-Agent: opencode/1.18.31" -H "x-opencode-session: <YOUR_VALID_OPENCODE_SESSION>" --data-binary @/tmp/opencode-test.json
 ```
 
-A healthy response is SSE and ends with:
+正常情况下会得到 SSE 流式响应，结尾类似：
 
 ```text
 data: ... "content":"OK" ...
 data: [DONE]
 ```
 
-## New API
+## New API 部署
 
-Example container deployment:
+示例 Docker 部署：
 
 ```bash
 docker network create ai
 docker run --name new-api -d --restart always --network ai -p 3000:3000 -v /data/new-api:/data calciumion/new-api:latest
 ```
 
-Create an OpenAI-type channel for OpenCode Zen.
+然后在 New API 中创建一个 OpenAI 类型渠道。
+
+## New API 渠道配置
 
 ### Base URL
 
-When using Resin:
+如果通过 Resin 转发：
 
 ```text
 http://resin:2260/Default/%2E/https/opencode.ai/zen
 ```
 
-### Request-header override
+### 请求头覆盖
 
-Keep real secret values only in New API's private configuration.
+真实 Session 只应保存在你自己的 New API 私有配置里。
 
-Example:
+示例：
 
 ```json
 {
@@ -161,15 +216,34 @@ Example:
 }
 ```
 
-Only `User-Agent` and a valid `x-opencode-session` were proven necessary in the isolated tests above. The additional headers are retained here as a production-style example.
+根据逐项测试结果，真正确认必要的是：
 
-### Parameter override
+```text
+User-Agent
+x-opencode-session
+```
 
-New API's UI notes that `stream` cannot reliably be forced by parameter override. The client should therefore send `"stream": true` itself.
+其余几个请求头可以保留，但不是必须项。
 
-The important request-body addition is the `bash` + `read` tool pair.
+### 参数覆盖
 
-A tested override structure is:
+New API 界面会提示：
+
+```text
+无法覆盖 stream 参数
+```
+
+因此不要依赖参数覆盖强制设置 `stream:true`。
+
+真正的客户端请求本身应该主动发送：
+
+```json
+"stream": true
+```
+
+参数覆盖里最重要的是给请求补上 `bash` 和 `read` 两个 tools。
+
+示例：
 
 ```json
 {
@@ -218,43 +292,97 @@ A tested override structure is:
 }
 ```
 
-## Important: enable stream mode in New API's channel tester
+其中 `stream_options` 和 `tool_choice` 在测试中已经确认不是必要条件，保留只是为了贴近完整请求结构。
 
-A confusing failure looked like this:
+## New API 后台测试为什么会报 invalid character 'd'
+
+一个非常容易误导的报错：
 
 ```text
 invalid character 'd' looking for beginning of value
 ```
 
-The reason was:
+实际原因是：
 
-1. The channel tester was in non-stream mode.
-2. The upstream returned an SSE stream beginning with `data:`.
-3. New API tried to parse the SSE response as ordinary JSON.
-4. The first character it encountered was `d`, producing the parse error.
+1. New API 的渠道测试器处于非流式模式
+2. 参数覆盖或上游请求实际变成了流式
+3. OpenCode Zen 正常返回 SSE：
+   ```text
+   data: {...}
+   ```
+4. New API 测试器却把它当普通 JSON 解析
+5. 第一个字符就是 `d`
+6. 因此出现：
+   ```text
+   invalid character 'd' looking for beginning of value
+   ```
 
-Enable **stream mode** in the New API test dialog before testing these models.
+解决方法：
 
-If a real client request works and returns SSE while the non-stream channel tester shows the error above, the upstream channel may already be healthy.
+**在 New API 的渠道测试窗口右上角开启“流式模式”。**
 
-## Real New API test
+开启之后再测试，就能正确处理 SSE 响应。
 
-The real client request must explicitly use streaming:
+因此：
 
-```bash
-curl -N -s https://api.example.com/v1/chat/completions -H "Authorization: Bearer <YOUR_NEW_API_KEY>" -H "Content-Type: application/json" -d '{"model":"mimo-v2.5-free","stream":true,"messages":[{"role":"user","content":"Reply with OK only"}]}'
+```text
+invalid character 'd'
 ```
 
-Expected ending:
+并不一定代表上游失败，反而可能说明上游已经正常返回了 `data:` 流。
+
+## 真实 New API 调用测试
+
+真实客户端必须明确使用流式请求。
+
+例如：
+
+```bash
+curl -N -s https://api.example.com/v1/chat/completions -H "Authorization: Bearer <YOUR_NEW_API_KEY>" -H "Content-Type: application/json" -d '{"model":"mimo-v2.5-free","stream":true,"messages":[{"role":"user","content":"只回复OK"}]}'
+```
+
+成功时结尾类似：
 
 ```text
 data: ... "content":"OK" ...
 data: [DONE]
 ```
 
+## 一个非常隐蔽的问题：改错渠道
+
+如果 New API 中存在两个支持同一模型的渠道，例如：
+
+```text
+#1 zen-free
+#2 zen-free_copy
+```
+
+你可能修改的是 #2，但真实 API 请求却被 New API 路由到了 #1。
+
+这会导致：
+
+```text
+后台测试 #2 看起来已经接近成功
+真实 API 仍然 403
+```
+
+排查时查看 New API 日志：
+
+```text
+channel error (channel #1, status code: 403)
+```
+
+如果日志显示真实请求走了旧渠道，应：
+
+- 临时禁用旧渠道
+- 或把两个渠道配置同步
+- 再重新测试
+
+真实请求成功后，可以确认整个链路已经打通。
+
 ## Resin
 
-Example Docker Compose configuration:
+示例 Docker Compose：
 
 ```yaml
 services:
@@ -279,15 +407,27 @@ networks:
     external: true
 ```
 
-Keep the management port bound to localhost unless you intentionally secure and expose it.
+建议只把 Resin 管理端口绑定到：
 
-New API and Resin must share the same Docker network so New API can reach:
+```text
+127.0.0.1:2260
+```
+
+不要直接暴露到公网。
+
+New API 和 Resin 需要处于同一个 Docker 网络，例如：
+
+```text
+ai
+```
+
+这样 New API 才能访问：
 
 ```text
 http://resin:2260
 ```
 
-## Troubleshooting
+## 常见报错与含义
 
 ### 403 FreeTierError
 
@@ -295,15 +435,15 @@ http://resin:2260
 OpenCode's free tier can only be used from within OpenCode
 ```
 
-Check, in order:
+优先检查：
 
-- client sends `stream: true`
-- upstream request contains an OpenCode-style User-Agent
-- `x-opencode-session` is a valid session from your own OpenCode client
-- request contains both `bash` and `read` tools
-- the request is actually routed through the channel you edited
+1. 客户端是否发送 `stream:true`
+2. 上游是否有 OpenCode 风格 User-Agent
+3. `x-opencode-session` 是否真实有效
+4. 请求体中是否同时存在 `bash` 和 `read`
+5. 真实请求是否真的走了你修改过的 New API 渠道
 
-One subtle routing problem found during testing was having two New API channels for the same model. Configuration changes were made to one channel, while real traffic was routed to the other. Disable the stale channel or synchronize both configurations before retesting.
+这个错误属于客户端身份/请求结构校验层。
 
 ### 401 Missing API key
 
@@ -311,69 +451,125 @@ One subtle routing problem found during testing was having two New API channels 
 AuthError: Missing API key.
 ```
 
-This generally means the selected upstream model requires authenticated/paid access and is not available through the anonymous/free path being used by this setup.
+通常意味着：
 
-Do not treat every model returned by a model-list endpoint as free.
+当前模型需要上游 API Key 或付费鉴权，不属于当前匿名/免费调用路径。
+
+因此不要看到模型存在于 `/v1/models` 就默认它一定免费可用。
 
 ### 400 Model is unavailable
 
-The model ID may still exist in an old configuration while the upstream has removed or disabled it.
+例如：
 
-Refresh the current model list and remove stale IDs.
+```text
+Model is unavailable
+```
 
-### `invalid character 'd'`
+说明：
 
-Enable stream mode in the New API channel-test dialog.
+- 模型可能已经下线
+- 模型 ID 已过期
+- 本地 New API 模型列表没有及时更新
 
-### New API says `IsStream: false`
+建议重新获取实时模型列表并清理旧模型。
 
-The built-in channel tester can be non-streaming even when a real client uses streaming. Inspect real relay traffic separately and do not use a non-stream test result as the only health signal for an SSE-only upstream path.
+### 429 FreeUsageLimitError
 
-## Distinguishing the three failure layers
+通常属于：
+
+```text
+免费额度 / 限流层
+```
+
+它和 403 是两类完全不同的问题。
+
+## 三种错误要分开处理
 
 ```text
 403 FreeTierError
-  -> upstream client-validation problem
+  -> 客户端身份 / 请求结构校验
 
 401 Missing API key
-  -> model/authentication requirement
+  -> 模型需要鉴权或付费 Key
 
 429 FreeUsageLimitError
-  -> quota or rate-limit layer
+  -> 免费额度 / 速率限制
 ```
 
-These should be debugged separately.
+更换代理 IP 并不能解决 403。
 
-Changing proxy IPs does not solve a 403 client-validation failure.
+## Resin 多出口与代理池
 
-## Proxy pools and multiple egress IPs
+Resin 可以用于：
 
-Resin can provide multiple proxy egress routes for availability, network fault isolation, and handling IP-scoped rate limits where permitted by the upstream service.
+- 多代理出口
+- 网络故障切换
+- 出口 IP 健康检查
+- 在上游允许的范围内处理 IP 级限流
+- 提高链路可用性
 
-This repository does not provide instructions for bypassing provider quotas or usage restrictions. Follow the upstream provider's current Terms of Service and rate-limit policies.
+本仓库不提供绕过上游配额或使用限制的教程。
 
-## Security checklist
+请根据上游当前服务条款和限流规则使用。
 
-Never commit any of the following:
+## 如何查看当前模型列表
+
+可以直接请求：
+
+```bash
+curl -s https://opencode.ai/zen/v1/models
+```
+
+如果只想简单筛选名称中包含 `-free` 的模型，可以：
+
+```bash
+curl -s https://opencode.ai/zen/v1/models | python3 -c 'import sys,json; d=json.load(sys.stdin)["data"]; print("\n".join(x["id"] for x in d if x["id"].endswith("-free") or x["id"]=="big-pickle"))'
+```
+
+注意：
+
+模型名带 `-free` 只能作为候选判断。
+
+真正是否可用，仍建议通过真实流式请求验证。
+
+## 模型健康状态建议
+
+建议区分以下状态：
 
 ```text
-New API token
-OpenCode session ID
-OpenCode/API credentials
-Resin admin token
-proxy subscription URL
-proxy node credentials
-server public IP if you consider it private
-real domain if you do not want it public
-TLS private keys
-Cloudflare credentials
-Azure credentials
-database backups
-New API data directory
-HAR files / copied cURL captures containing secrets
+成功
+401 -> 需要鉴权
+403 -> 客户端校验失败
+400 -> 模型不可用
+429 -> 限流或额度耗尽
 ```
 
-Recommended patterns:
+不要把所有失败都归为“模型坏了”。
+
+## 安全检查清单
+
+绝对不要提交以下内容：
+
+```text
+New API Token
+OpenCode Session ID
+OpenCode/API Key
+Resin 管理 Token
+代理订阅链接
+代理节点账号密码
+服务器公网 IP（如果你不希望公开）
+真实域名（如果你不希望公开）
+TLS 私钥
+Cloudflare 凭证
+Azure 凭证
+数据库备份
+New API 数据目录
+HAR 抓包文件
+Copy as cURL 中的真实密钥
+聊天记录里出现过的真实 Token
+```
+
+推荐统一使用：
 
 ```text
 <YOUR_NEW_API_KEY>
@@ -383,47 +579,65 @@ https://api.example.com
 <YOUR_SERVER_IP>
 ```
 
-If a secret is ever pasted into a public issue, commit, log, HAR file, or chat transcript, rotate it rather than relying on redaction after the fact.
+如果某个真实密钥曾经出现在：
 
-## Notes on model availability
+- GitHub
+- Issue
+- 日志
+- HAR
+- 抓包文件
+- Copy as cURL
+- 聊天记录
 
-Free/temporary model availability changes over time.
+最安全的做法是直接旋转/重新生成，而不是只做文本打码。
 
-Use live upstream model discovery plus a real streaming request to verify a model before publishing it through your gateway.
-
-A practical model-health check should distinguish:
-
-- request succeeds
-- 401: authentication required
-- 403: client validation failed
-- 400: model unavailable
-- 429: rate/quota limit
-
-## Status
-
-Verified working flow:
+## 当前已验证成功的链路
 
 ```text
-OpenAI-compatible streaming client
+OpenAI 兼容流式客户端
   -> New API
   -> Resin
   -> OpenCode Zen
-  -> free chat-completions model
-  -> SSE response
+  -> 免费 chat/completions 模型
+  -> SSE 正常返回
 ```
 
-Tested successfully with a placeholder-safe equivalent of:
+已经实际验证过的请求结构：
 
 ```text
 model: mimo-v2.5-free
 stream: true
 tools: bash + read
-valid OpenCode session
-OpenCode-style User-Agent
+有效 OpenCode Session
+OpenCode 风格 User-Agent
 ```
 
-## Disclaimer
+最终可以正常收到：
 
-This is an independent community deployment note and is not affiliated with OpenCode, New API, or Resin.
+```text
+data: ... "content":"OK" ...
+data: [DONE]
+```
 
-Upstream behavior can change without notice. Re-test request requirements after provider updates and use the service in accordance with its current terms and policies.
+## 说明
+
+OpenCode Zen 的上游规则可能随时调整。
+
+如果未来再次出现：
+
+```text
+403
+401
+429
+Model unavailable
+```
+
+建议重新做最小化 A/B 测试，不要直接假设还是旧原因。
+
+本文档记录的是已经实际验证过的一套排查过程和部署经验。
+
+## 免责声明
+
+本项目是独立的社区部署与故障排查记录，与 OpenCode、New API、Resin 官方均无隶属或背书关系。
+
+请在遵守相关服务条款、访问规则和限流政策的前提下使用。
