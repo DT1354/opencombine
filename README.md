@@ -4,7 +4,7 @@
 
 这个仓库记录了一套已经实际跑通的部署方式，以及在 2026 年 9 月 OpenCode Zen 加强免费层客户端校验后，如何定位并解决 403、流式响应解析、渠道路由、模型鉴权等问题。
 
-> 本仓库**不会包含任何真实 API Key、Session、代理订阅、服务器 IP、域名、访问令牌或其他敏感信息**。所有示例均使用占位符，请自行替换，并且不要把真实密钥提交到 Git。
+>所有示例均使用占位符，请自行替换
 
 ## 整体架构
 
@@ -45,7 +45,7 @@ OpenCode Zen
 403 FreeTierError
 OpenCode's free tier can only be used from within OpenCode
 ```
-
+检查发现由于opencode更新，不能正常第三方调用上游，官方说法仅在opencode客户端
 排查后确认基础设施本身都正常：
 
 - New API 正常运行
@@ -156,7 +156,7 @@ tools 中同时存在 bash 和 read
 
 ## 直接测试 OpenCode Zen
 
-只使用你自己的合法 Session，不要把真实 Session 提交到仓库。
+使用你自己的合法 Session，
 
 先创建请求体：
 
@@ -202,7 +202,6 @@ http://resin:2260/Default/%2E/https/opencode.ai/zen
 
 ### 请求头覆盖
 
-真实 Session 只应保存在你自己的 New API 私有配置里。
 
 示例：
 
@@ -413,8 +412,6 @@ networks:
 127.0.0.1:2260
 ```
 
-不要直接暴露到公网。
-
 New API 和 Resin 需要处于同一个 Docker 网络，例如：
 
 ```text
@@ -508,9 +505,7 @@ Resin 可以用于：
 - 在上游允许的范围内处理 IP 级限流
 - 提高链路可用性
 
-本仓库不提供绕过上游配额或使用限制的教程。
 
-请根据上游当前服务条款和限流规则使用。
 
 ## 如何查看当前模型列表
 
@@ -546,50 +541,6 @@ curl -s https://opencode.ai/zen/v1/models | python3 -c 'import sys,json; d=json.
 
 不要把所有失败都归为“模型坏了”。
 
-## 安全检查清单
-
-绝对不要提交以下内容：
-
-```text
-New API Token
-OpenCode Session ID
-OpenCode/API Key
-Resin 管理 Token
-代理订阅链接
-代理节点账号密码
-服务器公网 IP（如果你不希望公开）
-真实域名（如果你不希望公开）
-TLS 私钥
-Cloudflare 凭证
-Azure 凭证
-数据库备份
-New API 数据目录
-HAR 抓包文件
-Copy as cURL 中的真实密钥
-聊天记录里出现过的真实 Token
-```
-
-推荐统一使用：
-
-```text
-<YOUR_NEW_API_KEY>
-<YOUR_VALID_OPENCODE_SESSION>
-<YOUR_RANDOM_ADMIN_TOKEN>
-https://api.example.com
-<YOUR_SERVER_IP>
-```
-
-如果某个真实密钥曾经出现在：
-
-- GitHub
-- Issue
-- 日志
-- HAR
-- 抓包文件
-- Copy as cURL
-- 聊天记录
-
-最安全的做法是直接旋转/重新生成，而不是只做文本打码。
 
 ## 当前已验证成功的链路
 
